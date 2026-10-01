@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from app.core.clock import Clock
+from app.core.clock import Clock, SystemClock
 from app.germplasm.accessions import AccessionService
 from app.germplasm.inventory import InventoryService
 from app.germplasm.quality import DistributionService, QualityService
@@ -15,11 +15,13 @@ class GermplasmService:
 
     def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None) -> None:
         self.connection = connection
+        self.clock = clock or SystemClock()
         self.repository = GermplasmRepository(connection)
         self.accessions = AccessionService(connection, clock)
         self.inventory = InventoryService(connection, clock)
         self.viability = ViabilityService(connection, clock)
         self.quality = QualityService(connection, clock)
+        self.environment = self.quality.environment
         self.distribution = DistributionService(connection, clock)
 
     def dashboard(self) -> dict:
@@ -30,5 +32,11 @@ class GermplasmService:
             "viability_tests": self.repository.count_table("viability_tests"),
             "retest_schedules": self.repository.count_table("retest_schedules"),
             "quality_alerts": self.repository.count_table("quality_alerts"),
+            "environment_events": self.connection.execute(
+                "SELECT COUNT(*) FROM environment_events WHERE status!='superseded'"
+            ).fetchone()[0],
+            "environment_assessments_pending": self.connection.execute(
+                "SELECT COUNT(*) FROM event_assessments WHERE status IN ('pending','awaiting_confirmation')"
+            ).fetchone()[0],
             "distribution_requests": self.repository.count_table("distribution_requests"),
         }

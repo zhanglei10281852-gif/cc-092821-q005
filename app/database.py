@@ -392,6 +392,110 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events(status,available_at,id);
+
+CREATE TABLE IF NOT EXISTS environment_rule_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version TEXT NOT NULL UNIQUE,
+    temperature_tolerance_c REAL NOT NULL,
+    temperature_critical_c REAL NOT NULL,
+    humidity_tolerance_percent REAL NOT NULL,
+    humidity_critical_percent REAL NOT NULL,
+    max_gap_minutes INTEGER NOT NULL CHECK(max_gap_minutes > 0),
+    freeze_minutes INTEGER NOT NULL CHECK(freeze_minutes >= 0),
+    retest_minutes INTEGER NOT NULL CHECK(retest_minutes >= 0),
+    retest_due_days INTEGER NOT NULL CHECK(retest_due_days > 0),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_by TEXT NOT NULL DEFAULT 'system',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS environment_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_no TEXT NOT NULL UNIQUE,
+    location_id INTEGER NOT NULL REFERENCES storage_locations(id) ON DELETE CASCADE,
+    segment_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK(status IN ('open','closed','reopened','superseded')),
+    rule_version TEXT NOT NULL,
+    first_reading_id INTEGER NOT NULL,
+    last_reading_id INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    peak_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_minutes INTEGER,
+    max_temperature_c REAL,
+    min_temperature_c REAL,
+    max_humidity_percent REAL,
+    min_humidity_percent REAL,
+    temperature_peak_c REAL,
+    temperature_peak_at TEXT,
+    humidity_peak_percent REAL,
+    humidity_peak_at TEXT,
+    peak_score REAL NOT NULL DEFAULT 0,
+    severity TEXT NOT NULL CHECK(severity IN ('warning','critical')),
+    metrics TEXT NOT NULL DEFAULT '',
+    reading_ids_json TEXT NOT NULL DEFAULT '[]',
+    revision INTEGER NOT NULL DEFAULT 1,
+    superseded_by INTEGER REFERENCES environment_events(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_env_events_location ON environment_events(location_id,status,started_at);
+CREATE TABLE IF NOT EXISTS event_reading_links (
+    event_id INTEGER NOT NULL REFERENCES environment_events(id) ON DELETE CASCADE,
+    reading_id INTEGER NOT NULL REFERENCES environment_readings(id) ON DELETE CASCADE,
+    PRIMARY KEY(event_id,reading_id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_links_reading ON event_reading_links(reading_id);
+CREATE TABLE IF NOT EXISTS event_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES environment_events(id) ON DELETE CASCADE,
+    event_revision INTEGER NOT NULL,
+    rule_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','awaiting_confirmation','confirmed','superseded')),
+    affected_json TEXT NOT NULL DEFAULT '[]',
+    recommendation TEXT NOT NULL DEFAULT '',
+    recommendation_reason TEXT NOT NULL DEFAULT '',
+    override_json TEXT,
+    job_id INTEGER,
+    requested_by TEXT NOT NULL DEFAULT '',
+    confirmed_by TEXT,
+    confirmed_at TEXT,
+    applied_result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assessments_active_revision
+    ON event_assessments(event_id,event_revision) WHERE status!='superseded';
+CREATE INDEX IF NOT EXISTS idx_assessments_status ON event_assessments(status);
+CREATE TABLE IF NOT EXISTS event_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES environment_events(id) ON DELETE CASCADE,
+    assessment_id INTEGER NOT NULL REFERENCES event_assessments(id) ON DELETE CASCADE,
+    actor TEXT NOT NULL,
+    system_recommendation TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('freeze','retest','none')),
+    reason TEXT NOT NULL,
+    rule_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS event_retest_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES environment_events(id) ON DELETE CASCADE,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
+    assessment_id INTEGER NOT NULL REFERENCES event_assessments(id) ON DELETE CASCADE,
+    due_on TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'scheduled' CHECK(status IN ('scheduled','consumed','cancelled')),
+    test_id INTEGER REFERENCES viability_tests(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(event_id,lot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_retest_due ON event_retest_orders(status,due_on);
+CREATE TABLE IF NOT EXISTS event_disposition_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES environment_events(id) ON DELETE CASCADE,
+    hold_id INTEGER REFERENCES lot_holds(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(event_id,hold_id)
+);
 '''
 
 PERMISSIONS = [
@@ -410,6 +514,9 @@ PERMISSIONS = [
     ("viability.read", "查看活力检测", "viability", "read"),
     ("viability.write", "执行活力检测", "viability", "write"),
     ("quality.review", "复核质量结果", "quality", "review"),
+    ("environment.read", "查看环境异常事件", "environment", "read"),
+    ("environment.assess", "执行环境异常影响评估", "environment", "assess"),
+    ("environment.confirm", "确认环境异常处置", "environment", "confirm"),
     ("distribution.approve", "审批种质发放", "distribution", "approve"),
 ]
 
@@ -495,10 +602,11 @@ def init_db() -> None:
             (administrator, timestamp),
         )
         role_permissions = {
-            "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write"],
-            "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write"],
-            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
-            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read"],
+            "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write", "environment.read"],
+            "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write", "environment.read"],
+            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve",
+                        "environment.read", "environment.assess", "environment.confirm"],
+            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read", "environment.read"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
@@ -508,6 +616,12 @@ def init_db() -> None:
                     "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) VALUES(?,?,?)",
                     (role_id, permission_id, timestamp),
                 )
+        connection.execute(
+            "INSERT OR IGNORE INTO environment_rule_versions(version,temperature_tolerance_c,temperature_critical_c,"
+            "humidity_tolerance_percent,humidity_critical_percent,max_gap_minutes,freeze_minutes,retest_minutes,"
+            "retest_due_days,active,created_by,created_at) VALUES('env-rule-v1',5,10,15,30,120,240,120,30,1,'system',?)",
+            (timestamp,),
+        )
 
 
 def migrate_db() -> None:

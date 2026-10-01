@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 from datetime import timedelta
@@ -8,6 +7,7 @@ from typing import Any
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, ValidationError
+from app.germplasm.events import EnvironmentService
 from app.germplasm.repository import GermplasmRepository, record, records
 
 
@@ -16,8 +16,9 @@ class QualityService:
         self.connection = connection
         self.clock = clock or SystemClock()
         self.repository = GermplasmRepository(connection)
+        self.environment = EnvironmentService(connection, self.clock)
 
-    def add_reading(self, data: dict[str, Any]) -> dict[str, Any]:
+    def add_reading(self, data: dict[str, Any], *, sync_events: bool = True) -> dict[str, Any]:
         location = self.repository.require_location(int(data["location_id"]))
         observed_at = data["observed_at"]
         timestamp = to_storage(self.clock.now())
@@ -40,25 +41,48 @@ class QualityService:
                 or float(existing["humidity_percent"]) != float(data["humidity_percent"])
             ):
                 raise ConflictError("同一来源读数键对应了不同数据")
-            return {"reading": existing, "replayed": True, "alerts": []}
+            return {"reading": existing, "replayed": True, "alerts": [], "events": []}
         reading = record(self.connection.execute("SELECT * FROM environment_readings WHERE id=?", (cursor.lastrowid,)).fetchone())
-        alerts = self._evaluate_reading(location, reading or {}, timestamp)
-        return {"reading": reading, "replayed": False, "alerts": alerts}
+        if not sync_events:
+            return {"reading": reading, "replayed": False, "alerts": [], "events": []}
+        return self._result_with_events(location["id"], reading)
+
+    def _result_with_events(self, location_id: int, reading: dict[str, Any]) -> dict[str, Any]:
+        # 连续越界读数归并为事件；每个事件只产生一条聚合告警，迟到补传确定性修订窗口而不新增告警。
+        events = self.environment.sync_location(location_id)
+        alerts: list[dict[str, Any]] = []
+        for event in events:
+            row = self.connection.execute(
+                "SELECT * FROM quality_alerts WHERE alert_key=?", (f"environment-event-{event['id']}",)
+            ).fetchone()
+            alert = record(row)
+            if alert:
+                alerts.append(alert)
+        return {"reading": reading, "replayed": False, "alerts": alerts, "events": events}
 
     def import_readings(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
+        touched_locations: set[int] = set()
+        last_reading_by_location: dict[int, dict[str, Any]] = {}
         for index, item in enumerate(rows, start=1):
             marker = f"reading_import_{index}"
             self.connection.execute(f"SAVEPOINT {marker}")
             try:
-                result = self.add_reading(item)
+                result = self.add_reading(item, sync_events=False)
                 self.connection.execute(f"RELEASE SAVEPOINT {marker}")
                 accepted.append({"row": index, "id": result["reading"]["id"], "replayed": result["replayed"]})
+                if not result["replayed"]:
+                    location_id = int(result["reading"]["location_id"])
+                    touched_locations.add(location_id)
+                    last_reading_by_location[location_id] = result["reading"]
             except Exception as exc:
                 self.connection.execute(f"ROLLBACK TO SAVEPOINT {marker}")
                 self.connection.execute(f"RELEASE SAVEPOINT {marker}")
                 rejected.append({"row": index, "reason": str(exc)})
+        # 批量补传只对每个受影响库位统一归并一次，避免逐条全量重算。
+        for location_id in touched_locations:
+            self._result_with_events(location_id, last_reading_by_location[location_id])
         return {"accepted": accepted, "rejected": rejected, "accepted_count": len(accepted), "rejected_count": len(rejected)}
 
     def decide_alert(self, alert_id: int, data: dict[str, Any]) -> dict[str, Any]:
@@ -122,29 +146,6 @@ class QualityService:
             (location_id,),
         ).fetchone()[0]
         return {"location": location, "window_hours": hours, "readings": dict(row), "open_alerts": int(alerts)}
-
-    def _evaluate_reading(self, location: dict[str, Any], reading: dict[str, Any], timestamp: str) -> list[dict[str, Any]]:
-        deviations: list[tuple[str, float, float]] = []
-        temperature_delta = abs(float(reading["temperature_c"]) - float(location["temperature_c"]))
-        humidity_delta = abs(float(reading["humidity_percent"]) - float(location["humidity_percent"]))
-        if temperature_delta > 5:
-            deviations.append(("temperature", float(reading["temperature_c"]), float(location["temperature_c"])))
-        if humidity_delta > 15:
-            deviations.append(("humidity", float(reading["humidity_percent"]), float(location["humidity_percent"])))
-        alerts: list[dict[str, Any]] = []
-        for metric, observed, target in deviations:
-            digest = hashlib.sha256(f"{location['id']}:{reading['id']}:{metric}".encode()).hexdigest()[:20]
-            severity = "critical" if abs(observed - target) > (10 if metric == "temperature" else 30) else "warning"
-            message = f"库位 {location['location_code']} 的{('温度' if metric == 'temperature' else '湿度')}偏离设定值"
-            detail = {"reading_id": reading["id"], "metric": metric, "observed": observed, "target": target}
-            cursor = self.connection.execute(
-                "INSERT OR IGNORE INTO quality_alerts(alert_key,alert_type,severity,location_id,message,detail_json,"
-                "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (f"environment-{digest}", "environment_excursion", severity, location["id"], message, json.dumps(detail), timestamp, timestamp),
-            )
-            if cursor.rowcount:
-                alerts.append(self.repository.require_alert(int(cursor.lastrowid)))
-        return alerts
 
 
 class DistributionService:

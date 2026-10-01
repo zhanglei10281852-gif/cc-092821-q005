@@ -278,6 +278,44 @@ class AlertDecision(BaseModel):
     reason: str = Field(default="", max_length=500)
 
 
+class AssessmentRequest(BaseModel):
+    requested_by: str = Field(min_length=1, max_length=100)
+
+
+class AssessmentConfirm(BaseModel):
+    actor: str = Field(min_length=1, max_length=100)
+    decision: str | None = Field(default=None, pattern="^(freeze|retest|none)$")
+    reason: str = Field(default="", max_length=500)
+
+
+class EnvironmentRuleCreate(BaseModel):
+    version: str = Field(min_length=3, max_length=40, pattern=r"^[A-Za-z0-9._-]+$")
+    temperature_tolerance_c: float = Field(gt=0, le=60)
+    temperature_critical_c: float = Field(gt=0, le=80)
+    humidity_tolerance_percent: float = Field(gt=0, le=100)
+    humidity_critical_percent: float = Field(gt=0, le=100)
+    max_gap_minutes: int = Field(gt=0, le=10080)
+    freeze_minutes: int = Field(ge=0, le=10080)
+    retest_minutes: int = Field(ge=0, le=10080)
+    retest_due_days: int = Field(gt=0, le=3650)
+    created_by: str = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> "EnvironmentRuleCreate":
+        if self.freeze_minutes and self.retest_minutes and self.freeze_minutes < self.retest_minutes:
+            raise ValueError("质量冻结时长阈值不能短于提前复检时长阈值")
+        if self.temperature_critical_c <= self.temperature_tolerance_c:
+            raise ValueError("温度严重偏离阈值必须大于预警阈值")
+        if self.humidity_critical_percent <= self.humidity_tolerance_percent:
+            raise ValueError("湿度严重偏离阈值必须大于预警阈值")
+        return self
+
+
+class RetestOrderConsume(BaseModel):
+    test_id: int = Field(gt=0)
+    actor: str = Field(min_length=1, max_length=100)
+
+
 class DistributionCreate(BaseModel):
     request_no: str = Field(min_length=3, max_length=60)
     requester: str = Field(min_length=1, max_length=200)

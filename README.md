@@ -48,7 +48,19 @@ python -m app.cli demo
 - `app/germplasm/inventory.py` 管理批次、库位容量、容器摆放、移动、领用和冻结。
 - `app/germplasm/viability.py` 管理检测规程、取样、重复计数、活力结果与复检日程。
 - `app/germplasm/quality.py` 管理温湿度读数、偏离告警和种质发放审批。
+- `app/germplasm/events.py` 把连续越界读数按库位归并为环境异常事件，完成影响评估、人工确认与处置写入。
 - `app/api`、`app/services` 和 `app/repositories` 提供身份、权限、审计、后台作业及维护能力。
+
+## 环境异常事件与影响评估
+
+温湿度读数按 `(库位,来源键)` 去重，乱序补传时事件归并是对库位全部读数的*确定性重算*：
+
+- 连续越界读数归并为一个有开始、峰值、结束的事件；相邻读数间隔超过规则的最大间隔（默认 120 分钟）或出现正常读数时断窗。迟到补传只会修订既有事件的窗口（`revision` 递增）或把多个事件确定性合并，相同读数与重复评估不会产生额外事件。
+- 事件与评估都记录所依据的规则版本（`environment_rule_versions`，默认 `env-rule-v1`，可通过 `POST /api/germplasm/environment/rules` 发布新版本）。
+- 影响评估结合*当时有效*的容器摆放历史（`lot_placements` 的时间区间）列出受影响批次与暴露分钟数，按暴露时长和峰值偏离程度给出建议：质量冻结+提前复检（默认暴露≥240 分钟或严重偏离≥120 分钟）、仅提前复检（≥120 分钟或出现严重偏离）或仅观察。
+- 评估以后台作业运行（`pending → awaiting_confirmation`），可通过 `POST /api/germplasm/environment/jobs/run-pending` 或 `python -m app.cli run-environment-jobs` 驱动；作业租约过期后可被重新认领，进程重启后继续未完成的评估。
+- 值班员在 `POST /api/germplasm/environment/assessments/{id}/confirm` 人工确认后，质量冻结（`lot_holds`）、提前复检单（`event_retest_orders`）和审计记录才会在同一个即时事务中原子写入，重复确认幂等。人工覆盖系统建议必须填写原因，覆盖记录永久保留。
+- `GET /api/germplasm/environment/events/{id}` 可从一次事故追到全部越界读数、容器摆放、受影响批次、各修订号评估、冻结与提前复检单。迟到读数修订已确认事件时，旧评估保持 `confirmed` 作为历史，新修订需重新评估；已存在的冻结与复检单不会重复创建，避免关闭的事故被重复处理。
 
 ## 一致性约定
 

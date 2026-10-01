@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from app.api import audit, auth, roles, system, users
 from app.core.errors import DomainError
 from app.database import close_connection, init_db
+from app.germplasm.events_api import router as environment_router
 from app.germplasm.router import router as germplasm_router
 
 
@@ -37,6 +38,7 @@ app.include_router(roles.router)
 app.include_router(audit.router)
 app.include_router(system.router)
 app.include_router(germplasm_router)
+app.include_router(environment_router)
 
 
 @app.get("/")

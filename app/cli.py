@@ -24,6 +24,8 @@ def check_command() -> dict:
     required = {
         "accessions", "seed_lots", "storage_locations", "viability_tests",
         "retest_schedules", "quality_alerts", "outbox_events",
+        "environment_events", "event_assessments", "event_retest_orders",
+        "environment_rule_versions",
     }
     actual = {
         row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -110,6 +112,14 @@ def export_command(path: str) -> dict:
     return {"path": str(target), "count": total}
 
 
+def environment_jobs_command(limit: int = 100) -> dict:
+    """继续尚未完成的环境异常影响评估作业（进程重启后可重复执行）。"""
+    init_db()
+    service = GermplasmService(get_connection())
+    processed = service.environment.pump_assessment_jobs(max_jobs=limit)
+    return {"processed": len(processed), "assessments": processed}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="种质资源库运维命令")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -119,6 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("demo", help="写入一组示范入库数据")
     export = subparsers.add_parser("export-accessions", help="导出资源档案")
     export.add_argument("path")
+    env_jobs = subparsers.add_parser("run-environment-jobs", help="继续未完成的环境异常评估作业")
+    env_jobs.add_argument("--limit", type=int, default=100)
     return parser
 
 
@@ -134,7 +146,7 @@ def main() -> int:
         elif args.command == "demo":
             result = demo_command()
         else:
-            result = export_command(args.path)
+            result = export_command(args.path) if args.command == "export-accessions" else environment_jobs_command(args.limit)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (sqlite3.Error, RuntimeError, ValueError) as exc:
