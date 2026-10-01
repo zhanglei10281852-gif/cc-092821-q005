@@ -16,6 +16,9 @@ from app.germplasm.schemas import (
     CountCreate,
     DistributionCreate,
     DistributionDecision,
+    EventConfirm,
+    EventDismiss,
+    EventRuleCreate,
     HoldCreate,
     HoldRelease,
     LocationCreate,
@@ -317,6 +320,98 @@ def decide_alert(alert_id: int, data: AlertDecision, principal: Principal = Depe
     principal.require("quality.review")
     with transaction(immediate=True) as connection:
         return GermplasmService(connection).quality.decide_alert(alert_id, data.model_dump(mode="json"))
+
+
+@router.get("/environment/rules")
+def list_event_rules(principal: Principal = Depends(current_principal)) -> list[dict]:
+    principal.require("environment.read")
+    return _service().environment.list_rules()
+
+
+@router.post("/environment/rules", status_code=201)
+def create_event_rule(data: EventRuleCreate, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("environment.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).environment.create_rule(data.model_dump(mode="json"))
+
+
+@router.get("/environment/events")
+def list_environment_events(
+    status: str | None = Query(default=None, pattern="^(open|confirmed|dismissed|merged)$"),
+    location_id: int | None = Query(default=None, gt=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("environment.read")
+    items, total = _service().environment.list_events(
+        status=status, location_id=location_id, limit=limit, offset=offset
+    )
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/environment/events/{event_id}")
+def environment_event_detail(event_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("environment.read")
+    return _service().environment.event_detail(event_id)
+
+
+@router.post("/locations/{location_id}/environment/detect")
+def detect_environment_events(location_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("environment.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).environment.detect_location(location_id)
+
+
+@router.post("/environment/events/{event_id}/confirm")
+def confirm_environment_event(
+    event_id: int, data: EventConfirm, principal: Principal = Depends(current_principal)
+) -> dict:
+    principal.require("environment.review")
+    payload = data.model_dump(mode="json")
+    payload["actor_user_id"] = principal.user_id
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).environment.confirm_event(event_id, payload)
+
+
+@router.post("/environment/events/{event_id}/dismiss")
+def dismiss_environment_event(
+    event_id: int, data: EventDismiss, principal: Principal = Depends(current_principal)
+) -> dict:
+    principal.require("environment.review")
+    payload = data.model_dump(mode="json")
+    payload["actor_user_id"] = principal.user_id
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).environment.dismiss_event(event_id, payload)
+
+
+@router.post("/environment/jobs/run-pending")
+def run_pending_environment_jobs(
+    limit: int = Query(default=10, ge=1, le=100),
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    """驱动后台检测作业：每个作业独立事务提交，进程重启后继续领取未完成作业。"""
+    principal.require("jobs.run")
+    from app.core.errors import DomainError
+    from app.services.jobs import JobService
+
+    from app.germplasm.environment import JOB_TYPE_DETECT
+
+    results: list[dict] = []
+    for _ in range(limit):
+        with transaction(immediate=True) as connection:
+            jobs = JobService(connection)
+            job = jobs.claim(principal.username, lease_seconds=120, job_type=JOB_TYPE_DETECT)
+            if job is None:
+                break
+            try:
+                result = GermplasmService(connection).environment.execute_job(job, principal.username)
+            except DomainError as exc:
+                jobs.fail(int(job["id"]), principal.username, f"{exc.code}: {exc.message}", retry_seconds=300)
+                results.append({"job_id": int(job["id"]), "status": "retry", "error": exc.message})
+                continue
+        results.append({"job_id": int(job["id"]), "status": "completed", "result": result})
+    return {"processed": results, "count": len(results)}
 
 
 @router.post("/distributions", status_code=201)

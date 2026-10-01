@@ -315,7 +315,7 @@ CREATE TABLE IF NOT EXISTS retest_schedules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE CASCADE,
     source_test_id INTEGER REFERENCES viability_tests(id),
-    policy_id INTEGER NOT NULL REFERENCES retest_policies(id) ON DELETE RESTRICT,
+    policy_id INTEGER REFERENCES retest_policies(id) ON DELETE RESTRICT,
     due_on TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','notified','scheduled','superseded','waived')),
     reason TEXT NOT NULL,
@@ -353,6 +353,95 @@ CREATE TABLE IF NOT EXISTS quality_alerts (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_open ON quality_alerts(status,severity,created_at);
+
+CREATE TABLE IF NOT EXISTS environment_event_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_code TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    temperature_delta_c REAL NOT NULL CHECK(temperature_delta_c >= 0),
+    humidity_delta_percent REAL NOT NULL CHECK(humidity_delta_percent >= 0),
+    critical_temperature_delta_c REAL NOT NULL CHECK(critical_temperature_delta_c >= 0),
+    critical_humidity_delta_percent REAL NOT NULL CHECK(critical_humidity_delta_percent >= 0),
+    max_gap_minutes INTEGER NOT NULL CHECK(max_gap_minutes > 0),
+    hold_minutes INTEGER NOT NULL CHECK(hold_minutes >= 0),
+    critical_hold_minutes INTEGER NOT NULL CHECK(critical_hold_minutes >= 0),
+    retest_minutes INTEGER NOT NULL CHECK(retest_minutes >= 0),
+    retest_due_days INTEGER NOT NULL CHECK(retest_due_days > 0),
+    effective_from TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(rule_code,version)
+);
+CREATE TABLE IF NOT EXISTS environment_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_no TEXT NOT NULL UNIQUE,
+    location_id INTEGER NOT NULL REFERENCES storage_locations(id) ON DELETE CASCADE,
+    rule_id INTEGER NOT NULL REFERENCES environment_event_rules(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK(status IN ('open','confirmed','dismissed','merged')),
+    merged_into_event_id INTEGER REFERENCES environment_events(id),
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    closed_at TEXT,
+    target_temperature_c REAL NOT NULL,
+    target_humidity_percent REAL NOT NULL,
+    peak_temperature_c REAL,
+    peak_temperature_at TEXT,
+    peak_humidity_percent REAL,
+    peak_humidity_at TEXT,
+    max_temperature_delta_c REAL NOT NULL DEFAULT 0,
+    max_humidity_delta_percent REAL NOT NULL DEFAULT 0,
+    severity TEXT NOT NULL CHECK(severity IN ('warning','critical')),
+    metrics TEXT NOT NULL,
+    reading_count INTEGER NOT NULL DEFAULT 0,
+    window_revised INTEGER NOT NULL DEFAULT 0 CHECK(window_revised IN (0,1)),
+    fingerprint TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_env_events_location ON environment_events(location_id,started_at);
+CREATE INDEX IF NOT EXISTS idx_env_events_status ON environment_events(status,updated_at);
+CREATE TABLE IF NOT EXISTS environment_event_readings (
+    event_id INTEGER NOT NULL REFERENCES environment_events(id) ON DELETE CASCADE,
+    reading_id INTEGER NOT NULL REFERENCES environment_readings(id) ON DELETE CASCADE,
+    PRIMARY KEY(event_id,reading_id)
+);
+CREATE INDEX IF NOT EXISTS idx_env_event_readings_reading ON environment_event_readings(reading_id);
+CREATE TABLE IF NOT EXISTS environment_event_lots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES environment_events(id) ON DELETE CASCADE,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    placement_id INTEGER NOT NULL REFERENCES lot_placements(id) ON DELETE RESTRICT,
+    container_code TEXT NOT NULL,
+    overlap_started_at TEXT NOT NULL,
+    overlap_ended_at TEXT NOT NULL,
+    exposure_minutes INTEGER NOT NULL CHECK(exposure_minutes >= 0),
+    recommendation TEXT NOT NULL CHECK(recommendation IN ('hold','early_retest','monitor')),
+    recommendation_reason TEXT NOT NULL DEFAULT '',
+    override_action TEXT CHECK(override_action IN ('hold','early_retest','none')),
+    override_by TEXT,
+    override_at TEXT,
+    override_reason TEXT,
+    disposition_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(disposition_status IN ('pending','confirmed','dismissed')),
+    UNIQUE(event_id,lot_id,placement_id)
+);
+CREATE INDEX IF NOT EXISTS idx_env_event_lots_lot ON environment_event_lots(lot_id);
+CREATE INDEX IF NOT EXISTS idx_env_event_lots_disposition ON environment_event_lots(event_id,disposition_status);
+CREATE TABLE IF NOT EXISTS environment_event_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES environment_events(id) ON DELETE RESTRICT,
+    event_lot_id INTEGER NOT NULL REFERENCES environment_event_lots(id) ON DELETE RESTRICT,
+    lot_id INTEGER NOT NULL REFERENCES seed_lots(id) ON DELETE RESTRICT,
+    action_type TEXT NOT NULL CHECK(action_type IN ('hold','early_retest')),
+    hold_id INTEGER REFERENCES lot_holds(id),
+    test_id INTEGER REFERENCES viability_tests(id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_env_event_actions_event ON environment_event_actions(event_id);
 
 CREATE TABLE IF NOT EXISTS distribution_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -410,7 +499,27 @@ PERMISSIONS = [
     ("viability.read", "查看活力检测", "viability", "read"),
     ("viability.write", "执行活力检测", "viability", "write"),
     ("quality.review", "复核质量结果", "quality", "review"),
+    ("environment.read", "查看环境异常事件", "environment", "read"),
+    ("environment.review", "确认环境异常处置", "environment", "review"),
     ("distribution.approve", "审批种质发放", "distribution", "approve"),
+]
+
+
+DEFAULT_EVENT_RULES = [
+    {
+        "rule_code": "cold-storage-default",
+        "version": 1,
+        "temperature_delta_c": 5.0,
+        "humidity_delta_percent": 15.0,
+        "critical_temperature_delta_c": 10.0,
+        "critical_humidity_delta_percent": 30.0,
+        "max_gap_minutes": 60,
+        "hold_minutes": 240,
+        "critical_hold_minutes": 60,
+        "retest_minutes": 60,
+        "retest_due_days": 30,
+        "effective_from": "1970-01-01T00:00:00+00:00",
+    },
 ]
 
 
@@ -495,10 +604,11 @@ def init_db() -> None:
             (administrator, timestamp),
         )
         role_permissions = {
-            "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write"],
-            "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write"],
-            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
-            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read"],
+            "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write", "environment.read"],
+            "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write", "environment.read"],
+            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve",
+                        "environment.read", "environment.review"],
+            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read", "environment.read"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
@@ -508,6 +618,19 @@ def init_db() -> None:
                     "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) VALUES(?,?,?)",
                     (role_id, permission_id, timestamp),
                 )
+        for rule in DEFAULT_EVENT_RULES:
+            connection.execute(
+                "INSERT OR IGNORE INTO environment_event_rules(rule_code,version,active,temperature_delta_c,"
+                "humidity_delta_percent,critical_temperature_delta_c,critical_humidity_delta_percent,"
+                "max_gap_minutes,hold_minutes,critical_hold_minutes,retest_minutes,retest_due_days,"
+                "effective_from,created_by,created_at) VALUES(?,?,1,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    rule["rule_code"], rule["version"], rule["temperature_delta_c"], rule["humidity_delta_percent"],
+                    rule["critical_temperature_delta_c"], rule["critical_humidity_delta_percent"],
+                    rule["max_gap_minutes"], rule["hold_minutes"], rule["critical_hold_minutes"],
+                    rule["retest_minutes"], rule["retest_due_days"], rule["effective_from"], "system", timestamp,
+                ),
+            )
 
 
 def migrate_db() -> None:

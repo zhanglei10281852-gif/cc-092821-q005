@@ -278,6 +278,51 @@ class AlertDecision(BaseModel):
     reason: str = Field(default="", max_length=500)
 
 
+class EventRuleCreate(BaseModel):
+    rule_code: str = Field(min_length=2, max_length=40)
+    temperature_delta_c: float = Field(ge=0, le=100)
+    humidity_delta_percent: float = Field(ge=0, le=100)
+    critical_temperature_delta_c: float = Field(ge=0, le=100)
+    critical_humidity_delta_percent: float = Field(ge=0, le=100)
+    max_gap_minutes: int = Field(gt=0, le=10080)
+    hold_minutes: int = Field(ge=0, le=10080)
+    critical_hold_minutes: int = Field(ge=0, le=10080)
+    retest_minutes: int = Field(ge=0, le=10080)
+    retest_due_days: int = Field(gt=0, le=3650)
+    created_by: str = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> "EventRuleCreate":
+        if self.critical_temperature_delta_c < self.temperature_delta_c:
+            raise ValueError("严重温度偏离阈值不能小于预警阈值")
+        if self.critical_humidity_delta_percent < self.humidity_delta_percent:
+            raise ValueError("严重湿度偏离阈值不能小于预警阈值")
+        if self.critical_hold_minutes > self.hold_minutes:
+            raise ValueError("严重级别冻结时长阈值不应长于预警级别")
+        if self.retest_minutes > self.hold_minutes:
+            raise ValueError("提前复检时长阈值不应长于冻结阈值")
+        return self
+
+
+class EventLotDecision(BaseModel):
+    event_lot_id: int = Field(gt=0)
+    action: str = Field(pattern="^(hold|early_retest|none)$")
+    reason: str = Field(default="", max_length=500)
+    sampled_grams: float | None = Field(default=None, gt=0, le=100_000)
+
+
+class EventConfirm(BaseModel):
+    expected_version: int = Field(gt=0)
+    actor: str = Field(min_length=1, max_length=100)
+    decisions: list[EventLotDecision] = Field(min_length=1, max_length=500)
+
+
+class EventDismiss(BaseModel):
+    expected_version: int = Field(gt=0)
+    actor: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=2, max_length=500)
+
+
 class DistributionCreate(BaseModel):
     request_no: str = Field(min_length=3, max_length=60)
     requester: str = Field(min_length=1, max_length=200)

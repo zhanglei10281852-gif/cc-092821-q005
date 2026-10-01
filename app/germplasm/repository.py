@@ -205,7 +205,8 @@ class GermplasmRepository:
     def count_table(self, table: str) -> int:
         allowed = {
             "accessions", "seed_lots", "storage_locations", "viability_tests",
-            "retest_schedules", "quality_alerts", "distribution_requests",
+            "retest_schedules", "quality_alerts", "environment_events",
+            "environment_event_lots", "distribution_requests",
         }
         if table not in allowed:
             raise ValueError("不允许统计该数据表")

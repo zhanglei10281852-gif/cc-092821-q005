@@ -43,7 +43,14 @@ class QualityService:
             return {"reading": existing, "replayed": True, "alerts": []}
         reading = record(self.connection.execute("SELECT * FROM environment_readings WHERE id=?", (cursor.lastrowid,)).fetchone())
         alerts = self._evaluate_reading(location, reading or {}, timestamp)
-        return {"reading": reading, "replayed": False, "alerts": alerts}
+        job = None
+        try:
+            from app.germplasm.environment import EnvironmentEventService
+
+            job = EnvironmentEventService(self.connection, self.clock).enqueue_detection(location["id"])
+        except ConflictError:
+            job = None
+        return {"reading": reading, "replayed": False, "alerts": alerts, "detection_job_id": job["id"] if job else None}
 
     def import_readings(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
         accepted: list[dict[str, Any]] = []

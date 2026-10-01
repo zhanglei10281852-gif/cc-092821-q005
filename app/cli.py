@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -24,6 +25,7 @@ def check_command() -> dict:
     required = {
         "accessions", "seed_lots", "storage_locations", "viability_tests",
         "retest_schedules", "quality_alerts", "outbox_events",
+        "environment_events", "environment_event_lots", "environment_event_actions",
     }
     actual = {
         row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -110,6 +112,37 @@ def export_command(path: str) -> dict:
     return {"path": str(target), "count": total}
 
 
+def detect_environment_command(location_id: int) -> dict:
+    init_db()
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).environment.detect_location(location_id)
+
+
+def run_environment_jobs_command(limit: int = 10) -> dict:
+    """驱动到期的环境异常检测作业，可由定时任务或进程重启后重复调用。"""
+    from app.core.errors import DomainError
+    from app.germplasm.environment import JOB_TYPE_DETECT
+    from app.services.jobs import JobService
+
+    init_db()
+    worker = f"cli:{os.uname().nodename}"
+    processed: list[dict] = []
+    for _ in range(max(1, limit)):
+        with transaction(immediate=True) as connection:
+            jobs = JobService(connection)
+            job = jobs.claim(worker, lease_seconds=120, job_type=JOB_TYPE_DETECT)
+            if job is None:
+                break
+            try:
+                result = GermplasmService(connection).environment.execute_job(job, worker)
+            except DomainError as exc:
+                jobs.fail(int(job["id"]), worker, f"{exc.code}: {exc.message}", retry_seconds=300)
+                processed.append({"job_id": int(job["id"]), "status": "retry", "error": exc.message})
+                continue
+            processed.append({"job_id": int(job["id"]), "status": "completed", "result": result})
+    return {"processed": processed, "count": len(processed)}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="种质资源库运维命令")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -117,6 +150,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("check-db", help="检查数据库完整性")
     subparsers.add_parser("smoke", help="执行 HTTP 冒烟检查")
     subparsers.add_parser("demo", help="写入一组示范入库数据")
+    env_detect = subparsers.add_parser("environment-detect", help="立即重扫指定库位的环境读数并归并事件")
+    env_detect.add_argument("location_id", type=int)
+    env_runner = subparsers.add_parser("environment-jobs", help="执行到期的环境异常检测作业（重启续跑）")
+    env_runner.add_argument("--limit", type=int, default=10)
     export = subparsers.add_parser("export-accessions", help="导出资源档案")
     export.add_argument("path")
     return parser
@@ -133,6 +170,10 @@ def main() -> int:
             result = smoke_command()
         elif args.command == "demo":
             result = demo_command()
+        elif args.command == "environment-detect":
+            result = detect_environment_command(args.location_id)
+        elif args.command == "environment-jobs":
+            result = run_environment_jobs_command(args.limit)
         else:
             result = export_command(args.path)
         print(json.dumps(result, ensure_ascii=False, indent=2))
